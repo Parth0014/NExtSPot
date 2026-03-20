@@ -9,6 +9,7 @@ import {
   Save,
   Target,
   ArrowLeft,
+  Grid3X3,
 } from "lucide-react";
 import { io } from "socket.io-client";
 import API from "../api/api";
@@ -29,6 +30,7 @@ function AICameraSetup() {
   const [isLoading, setIsLoading] = useState(true);
 
   // Camera URL state
+  const [cameraSource, setCameraSource] = useState("ip"); // "ip" or "usb"
   const [showIpModal, setShowIpModal] = useState(false);
   const [ipInputValue, setIpInputValue] = useState("");
   const [cameraUrl, setCameraUrl] = useState("");
@@ -50,9 +52,16 @@ function AICameraSetup() {
   // Auto-detect state
   const [autoDetecting, setAutoDetecting] = useState(false);
 
+  // Grid adjustment state - for independent corner adjustment like document scanner
+  const [isAdjustingGrids, setIsAdjustingGrids] = useState(false);
+  const [adjustingGridIndex, setAdjustingGridIndex] = useState(-1);
+  const [adjustingPointIndex, setAdjustingPointIndex] = useState(-1);
+  const [hoveredGridIndex, setHoveredGridIndex] = useState(-1);
+  const [hoveredPointIndex, setHoveredPointIndex] = useState(-1);
+  const [gridCorners, setGridCorners] = useState({}); // Store independent corners for each grid
+
   // Refs
   const videoRef = useRef(null);
-  const canvasRef = useRef(null);
   const drawingCanvasRef = useRef(null);
   const frozenCanvasRef = useRef(null);
   const socketRef = useRef(null);
@@ -67,6 +76,172 @@ function AICameraSetup() {
         token,
       )}`
     : `${BACKEND_SERVER}/api/ai/stream/${spotId}`;
+
+  // USB Preview URL (works without active detection session)
+  const USB_PREVIEW_URL = token
+    ? `${BACKEND_SERVER}/api/ai/usb-preview?token=${encodeURIComponent(token)}`
+    : `${BACKEND_SERVER}/api/ai/usb-preview`;
+
+  // Determine which stream URL to use based on camera type and detection state
+  const getVideoStreamUrl = () => {
+    // For USB cameras not in detection mode, use preview stream
+    if ((cameraUrl === "usb" || cameraUrl.startsWith("usb:")) && !isDetecting) {
+      return USB_PREVIEW_URL;
+    }
+    // Otherwise use the main stream URL
+    return STREAM_URL;
+  };
+
+  // Normalize slot data to standard format
+  const normalizeSlots = (slots) => {
+    if (!Array.isArray(slots)) return [];
+    return slots
+      .map((slot, idx) => {
+        // If slot is already in correct format
+        if (slot && slot.bbox && Array.isArray(slot.bbox)) {
+          return slot;
+        }
+        // If slot is just an array (bbox)
+        if (Array.isArray(slot) && slot.length >= 4) {
+          const [x1, y1, x2, y2] = slot;
+          return {
+            slot_number: idx + 1,
+            bbox: [x1, y1, x2, y2],
+            bbox_normalized: [x1 / 1280, y1 / 720, x2 / 1280, y2 / 720],
+          };
+        }
+        // Invalid format
+        console.warn(`Invalid slot format at index ${idx}:`, slot);
+        return null;
+      })
+      .filter((slot) => slot !== null);
+  };
+
+  // Convert bbox to 4 independent corners (for document scanner-like adjustment)
+  const getGridCorners = useCallback(
+    (gridIndex) => {
+      // Check if there are temporary adjustment corners
+      if (gridCorners[gridIndex]) {
+        return gridCorners[gridIndex];
+      }
+
+      // Check if slot has persisted perspective corners
+      const slot = drawnRectangles[gridIndex];
+      if (
+        slot?.corners &&
+        Array.isArray(slot.corners) &&
+        slot.corners.length === 4
+      ) {
+        return slot.corners;
+      }
+
+      // Initialize corners from bbox
+      let bbox = slot?.bbox || slot;
+
+      if (!Array.isArray(bbox) || bbox.length < 4) {
+        return null;
+      }
+
+      const [x1, y1, x2, y2] = bbox;
+      return [
+        { x: x1, y: y1 }, // top-left
+        { x: x2, y: y1 }, // top-right
+        { x: x2, y: y2 }, // bottom-right
+        { x: x1, y: y2 }, // bottom-left
+      ];
+    },
+    [gridCorners, drawnRectangles],
+  );
+
+  // Convert 4 corners back to bbox
+  const cornersToBox = useCallback((corners) => {
+    if (!Array.isArray(corners) || corners.length < 4) return null;
+
+    const xCoords = corners.map((c) => c.x);
+    const yCoords = corners.map((c) => c.y);
+
+    const x1 = Math.min(...xCoords);
+    const y1 = Math.min(...yCoords);
+    const x2 = Math.max(...xCoords);
+    const y2 = Math.max(...yCoords);
+
+    return [x1, y1, x2, y2];
+  }, []);
+
+  // Perspective transformation: store corner points for non-rectangular grids
+  const getPerspectiveCorners = useCallback(
+    (gridIndex) => {
+      if (gridCorners[gridIndex]) {
+        return gridCorners[gridIndex];
+      }
+
+      // Initialize from bbox
+      const slot = drawnRectangles[gridIndex];
+      let bbox = slot?.bbox || slot;
+
+      if (!Array.isArray(bbox) || bbox.length < 4) {
+        return null;
+      }
+
+      const [x1, y1, x2, y2] = bbox;
+      return [
+        { x: x1, y: y1 }, // top-left
+        { x: x2, y: y1 }, // top-right
+        { x: x2, y: y2 }, // bottom-right
+        { x: x1, y: y2 }, // bottom-left
+      ];
+    },
+    [gridCorners, drawnRectangles],
+  );
+
+  // Draw perspective quadrilateral filled (for rendering distorted grids)
+  const drawPerspectiveQuad = useCallback(
+    (ctx, corners, color, label, index) => {
+      if (!corners || corners.length < 4) return;
+
+      // Draw the quadrilateral
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.moveTo(corners[0].x, corners[0].y);
+      ctx.lineTo(corners[1].x, corners[1].y);
+      ctx.lineTo(corners[2].x, corners[2].y);
+      ctx.lineTo(corners[3].x, corners[3].y);
+      ctx.closePath();
+      ctx.stroke();
+
+      // Draw label at center
+      const centerX =
+        (corners[0].x + corners[1].x + corners[2].x + corners[3].x) / 4;
+      const centerY =
+        (corners[0].y + corners[1].y + corners[2].y + corners[3].y) / 4;
+
+      ctx.fillStyle = color;
+      ctx.font = "bold 24px Arial";
+      ctx.fillText(label, centerX - 12, centerY + 8);
+    },
+    [],
+  );
+
+  // Determine which grid point is closest to clicked position
+  const getGridPointAtCoords = (x, y, threshold = 15) => {
+    const safeRects = drawnRectangles || [];
+    for (let i = 0; i < safeRects.length; i++) {
+      const corners = getGridCorners(i);
+      if (!corners) continue;
+
+      for (let pointIdx = 0; pointIdx < corners.length; pointIdx++) {
+        const corner = corners[pointIdx];
+        const distance = Math.sqrt(
+          Math.pow(corner.x - x, 2) + Math.pow(corner.y - y, 2),
+        );
+        if (distance <= threshold) {
+          return { gridIndex: i, pointIndex: pointIdx };
+        }
+      }
+    }
+    return null;
+  };
 
   // Load saved configuration on mount
   useEffect(() => {
@@ -418,8 +593,144 @@ function AICameraSetup() {
     setMessage("✏️ Click and drag to draw slot");
   };
 
+  // Adjustment Mode Canvas Handlers (Document Scanner Style)
+  const handleAdjustmentCanvasMouseDown = (e) => {
+    if (!isAdjustingGrids || !isFrozen) return;
+
+    const { x, y } = getCanvasCoords(e);
+    const result = getGridPointAtCoords(x, y, 15);
+
+    if (result) {
+      setAdjustingGridIndex(result.gridIndex);
+      setAdjustingPointIndex(result.pointIndex);
+    }
+  };
+
+  const handleAdjustmentCanvasMouseMove = (e) => {
+    if (!isAdjustingGrids || !isFrozen) return;
+
+    const { x, y } = getCanvasCoords(e);
+
+    // Check for hover
+    const hoverResult = getGridPointAtCoords(x, y, 15);
+    if (hoverResult) {
+      setHoveredGridIndex(hoverResult.gridIndex);
+      setHoveredPointIndex(hoverResult.pointIndex);
+      drawingCanvasRef.current.style.cursor = "grab";
+    } else {
+      setHoveredGridIndex(null);
+      setHoveredPointIndex(null);
+      drawingCanvasRef.current.style.cursor = "default";
+    }
+
+    // Handle dragging
+    if (adjustingGridIndex !== null && adjustingPointIndex !== null) {
+      drawingCanvasRef.current.style.cursor = "grabbing";
+
+      const corners =
+        gridCorners[adjustingGridIndex] || getGridCorners(adjustingGridIndex);
+      if (corners) {
+        const newCorners = [...corners];
+        // Constrain to canvas bounds
+        newCorners[adjustingPointIndex] = {
+          x: Math.max(0, Math.min(x, drawingCanvasRef.current.width)),
+          y: Math.max(0, Math.min(y, drawingCanvasRef.current.height)),
+        };
+
+        setGridCorners({
+          ...gridCorners,
+          [adjustingGridIndex]: newCorners,
+        });
+
+        // Trigger redraw with updated corners
+        redrawRectangles();
+      }
+    }
+  };
+
+  const handleAdjustmentCanvasMouseUp = (e) => {
+    if (adjustingGridIndex !== null && adjustingPointIndex !== null) {
+      // Persist the adjusted corners back to drawnRectangles
+      const corners = gridCorners[adjustingGridIndex];
+      if (corners) {
+        const newBox = cornersToBox(corners);
+        if (newBox) {
+          const updatedRects = drawnRectangles.map((rect, idx) => {
+            if (idx === adjustingGridIndex) {
+              const canvas = drawingCanvasRef.current;
+              return {
+                ...rect,
+                bbox: newBox,
+                bbox_normalized: [
+                  newBox[0] / canvas.width,
+                  newBox[1] / canvas.height,
+                  newBox[2] / canvas.width,
+                  newBox[3] / canvas.height,
+                ],
+                // Persist perspective corners for rendering
+                corners: corners,
+              };
+            }
+            return rect;
+          });
+          setDrawnRectangles(updatedRects);
+          setMessage(`🎯 Grid #${adjustingGridIndex + 1} adjusted`);
+        }
+      }
+    }
+
+    setAdjustingGridIndex(null);
+    setAdjustingPointIndex(null);
+    drawingCanvasRef.current.style.cursor = "default";
+  };
+
+  const handleAdjustmentCanvasMouseLeave = (e) => {
+    if (adjustingGridIndex !== null && adjustingPointIndex !== null) {
+      // Save pending adjustments
+      const corners = gridCorners[adjustingGridIndex];
+      if (corners) {
+        const newBox = cornersToBox(corners);
+        if (newBox) {
+          const updatedRects = drawnRectangles.map((rect, idx) => {
+            if (idx === adjustingGridIndex) {
+              const canvas = drawingCanvasRef.current;
+              return {
+                ...rect,
+                bbox: newBox,
+                bbox_normalized: [
+                  newBox[0] / canvas.width,
+                  newBox[1] / canvas.height,
+                  newBox[2] / canvas.width,
+                  newBox[3] / canvas.height,
+                ],
+                // Persist perspective corners for rendering
+                corners: corners,
+              };
+            }
+            return rect;
+          });
+          setDrawnRectangles(updatedRects);
+        }
+      }
+
+      setAdjustingGridIndex(null);
+      setAdjustingPointIndex(null);
+    }
+
+    setHoveredGridIndex(null);
+    setHoveredPointIndex(null);
+    drawingCanvasRef.current.style.cursor = "default";
+  };
+
   const handleCanvasMouseDown = (e) => {
     if (!isFrozen) return;
+
+    // Route to adjustment handler if in adjustment mode
+    if (isAdjustingGrids) {
+      handleAdjustmentCanvasMouseDown(e);
+      return;
+    }
+
     const { x, y } = getCanvasCoords(e);
 
     if (aoiMode) {
@@ -434,6 +745,11 @@ function AICameraSetup() {
   };
 
   const handleCanvasMouseMove = (e) => {
+    if (isAdjustingGrids) {
+      handleAdjustmentCanvasMouseMove(e);
+      return;
+    }
+
     if (!currentRect) return;
     const { x, y } = getCanvasCoords(e);
 
@@ -445,10 +761,15 @@ function AICameraSetup() {
 
     if (!isDrawing) return;
     setCurrentRect({ ...currentRect, x2: x, y2: y });
-    redrawRectangles([...drawnRectangles, { ...currentRect, x2: x, y2: y }]);
+    redrawRectangles(drawnRectangles, { ...currentRect, x2: x, y2: y }, false);
   };
 
   const handleCanvasMouseUp = (e) => {
+    if (isAdjustingGrids) {
+      handleAdjustmentCanvasMouseUp(e);
+      return;
+    }
+
     if (isDrawingAOI) {
       const { x, y } = getCanvasCoords(e);
       const finalRect = { ...currentRect, x2: x, y2: y };
@@ -531,52 +852,138 @@ function AICameraSetup() {
     };
   };
 
-  const redrawRectangles = (
-    rects = drawnRectangles,
-    tempRect = null,
-    isAOI = false,
-  ) => {
-    const canvas = drawingCanvasRef.current;
-    if (!canvas) return;
+  const redrawRectangles = useCallback(
+    (rects = drawnRectangles, tempRect = null, isAOI = false) => {
+      const canvas = drawingCanvasRef.current;
+      if (!canvas) return;
 
-    const ctx = canvas.getContext("2d");
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
+      const ctx = canvas.getContext("2d");
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-    // Draw AOI
-    if (aoiRect) {
-      const { x1, y1, x2, y2 } = aoiRect;
-      ctx.strokeStyle = "#FFFF00";
-      ctx.lineWidth = 4;
-      ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
-      ctx.fillStyle = "#FFFF00";
-      ctx.font = "bold 20px Arial";
-      ctx.fillText("AOI", x1 + 10, y1 + 30);
-    }
+      // Draw AOI
+      if (aoiRect) {
+        const { x1, y1, x2, y2 } = aoiRect;
+        ctx.strokeStyle = "#FFFF00";
+        ctx.lineWidth = 4;
+        ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+        ctx.fillStyle = "#FFFF00";
+        ctx.font = "bold 20px Arial";
+        ctx.fillText("AOI", x1 + 10, y1 + 30);
+      }
 
-    // Draw slots - ensure rects is always an array
-    const safeRects = rects || [];
-    safeRects.forEach((slot, index) => {
-      const [x1, y1, x2, y2] = slot.bbox;
-      ctx.strokeStyle = "#10B981";
-      ctx.lineWidth = 3;
-      ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
-      ctx.fillStyle = "#10B981";
-      ctx.font = "bold 24px Arial";
-      ctx.fillText(`#${index + 1}`, x1 + 10, y1 + 30);
-    });
+      // Draw slots - ensure rects is always an array
+      const safeRects = rects || [];
+      safeRects.forEach((slot, index) => {
+        let bbox = slot?.bbox || slot;
 
-    // Draw temp rectangle
-    if (tempRect) {
-      const x = Math.min(tempRect.x1, tempRect.x2);
-      const y = Math.min(tempRect.y1, tempRect.y2);
-      const w = Math.abs(tempRect.x2 - tempRect.x1);
-      const h = Math.abs(tempRect.y2 - tempRect.y1);
+        // Handle drawing preview format (x1, y1, x2, y2 properties)
+        if (bbox && typeof bbox === "object" && bbox.x1 !== undefined) {
+          bbox = [bbox.x1, bbox.y1, bbox.x2, bbox.y2];
+        }
 
-      ctx.strokeStyle = isAOI ? "#FFFF00" : "#F59E0B";
-      ctx.lineWidth = isAOI ? 4 : 2;
-      ctx.strokeRect(x, y, w, h);
-    }
-  };
+        if (!Array.isArray(bbox) || bbox.length < 4) return;
+
+        // Use perspective corners for rendering (hexagonal/document scanner style adjustment)
+        const perspectiveCorners = gridCorners[index] || getGridCorners(index);
+        if (perspectiveCorners && perspectiveCorners.length === 4) {
+          // Render as perspective quadrilateral
+          drawPerspectiveQuad(
+            ctx,
+            perspectiveCorners,
+            "#10B981",
+            `#${index + 1}`,
+            index,
+          );
+        } else {
+          // Fallback to axis-aligned rectangle if no perspective data
+          const [x1, y1, x2, y2] = bbox;
+          ctx.strokeStyle = "#10B981";
+          ctx.lineWidth = 3;
+          ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+          ctx.fillStyle = "#10B981";
+          ctx.font = "bold 24px Arial";
+          ctx.fillText(`#${index + 1}`, x1 + 10, y1 + 30);
+        }
+
+        // Draw adjustment handles if in adjustment mode or hovering
+        if (isAdjustingGrids || hoveredGridIndex === index) {
+          const corners = gridCorners[adjustingGridIndex]
+            ? gridCorners[adjustingGridIndex]
+            : getGridCorners(index);
+          if (corners) {
+            const cornerLabels = ["↖", "↗", "↘", "↙"];
+            corners.forEach((corner, pointIdx) => {
+              const isActive =
+                adjustingGridIndex === index &&
+                adjustingPointIndex === pointIdx;
+              const isHovered =
+                hoveredGridIndex === index && hoveredPointIndex === pointIdx;
+
+              const size = isActive ? 10 : isHovered ? 8 : 6;
+              const color = isActive
+                ? "#FF0000"
+                : isHovered
+                  ? "#FFC107"
+                  : "#00FF00";
+
+              ctx.fillStyle = color;
+              ctx.beginPath();
+              ctx.arc(corner.x, corner.y, size, 0, 2 * Math.PI);
+              ctx.fill();
+
+              // Draw label
+              ctx.fillStyle = color;
+              ctx.font = "bold 12px Arial";
+              ctx.fillText(cornerLabels[pointIdx], corner.x + 12, corner.y - 8);
+            });
+          }
+        }
+      });
+
+      // Draw live quadrilateral when actively adjusting
+      if (
+        isAdjustingGrids &&
+        adjustingGridIndex !== null &&
+        gridCorners[adjustingGridIndex]
+      ) {
+        const corners = gridCorners[adjustingGridIndex];
+        ctx.strokeStyle = "#FF0000";
+        ctx.lineWidth = 2;
+        ctx.setLineDash([5, 5]);
+        ctx.beginPath();
+        ctx.moveTo(corners[0].x, corners[0].y);
+        ctx.lineTo(corners[1].x, corners[1].y);
+        ctx.lineTo(corners[2].x, corners[2].y);
+        ctx.lineTo(corners[3].x, corners[3].y);
+        ctx.closePath();
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+
+      // Draw temp rectangle
+      if (tempRect) {
+        const x = Math.min(tempRect.x1, tempRect.x2);
+        const y = Math.min(tempRect.y1, tempRect.y2);
+        const w = Math.abs(tempRect.x2 - tempRect.x1);
+        const h = Math.abs(tempRect.y2 - tempRect.y1);
+
+        ctx.strokeStyle = isAOI ? "#FFFF00" : "#F59E0B";
+        ctx.lineWidth = isAOI ? 4 : 2;
+        ctx.strokeRect(x, y, w, h);
+      }
+    },
+    [
+      drawnRectangles,
+      aoiRect,
+      isAdjustingGrids,
+      adjustingGridIndex,
+      adjustingPointIndex,
+      hoveredGridIndex,
+      hoveredPointIndex,
+      gridCorners,
+      getGridCorners,
+    ],
+  );
 
   const deleteLastRectangle = () => {
     if (drawnRectangles.length === 0) return;
@@ -993,6 +1400,11 @@ function AICameraSetup() {
       color: "#ffffff",
       border: "none",
     },
+    buttonInfo: {
+      backgroundColor: "#3B82F6",
+      color: "#ffffff",
+      border: "none",
+    },
     buttonDisabled: {
       backgroundColor: "#E5E7EB",
       color: "#9CA3AF",
@@ -1038,6 +1450,25 @@ function AICameraSetup() {
       cursor: "pointer",
       fontSize: "12px",
       fontWeight: 500,
+    },
+    floatingActionButton: {
+      position: "absolute",
+      bottom: "16px",
+      right: "16px",
+      zIndex: 10,
+      display: "flex",
+      alignItems: "center",
+      gap: "8px",
+      backgroundColor: "rgba(0, 0, 0, 0.6)",
+      backdropFilter: "blur(8px)",
+      color: "#ffffff",
+      padding: "12px 16px",
+      borderRadius: "8px",
+      border: "none",
+      cursor: "pointer",
+      fontSize: "13px",
+      fontWeight: 500,
+      pointerEvents: "none",
     },
     occupancyGrid: {
       display: "grid",
@@ -1418,6 +1849,30 @@ function AICameraSetup() {
                 <Trash2 size={16} /> Clear All
               </button>
 
+              {/* Adjust Grids Button */}
+              <button
+                onClick={() => {
+                  setIsAdjustingGrids(!isAdjustingGrids);
+                  setMessage(
+                    isAdjustingGrids
+                      ? "❌ Adjustment mode disabled"
+                      : "🎯 Adjustment mode - drag corners like a document scanner",
+                  );
+                }}
+                disabled={drawnRectangles.length === 0 || !isFrozen}
+                style={{
+                  ...styles.button,
+                  ...(drawnRectangles.length === 0 || !isFrozen
+                    ? styles.buttonDisabled
+                    : isAdjustingGrids
+                      ? styles.buttonWarning
+                      : styles.buttonInfo),
+                }}
+              >
+                <Grid3X3 size={16} />{" "}
+                {isAdjustingGrids ? "Stop Adjusting" : "Adjust Grids"}
+              </button>
+
               {/* Save Grid */}
               <hr />
               <button
@@ -1543,6 +1998,7 @@ function AICameraSetup() {
                 onMouseDown={handleCanvasMouseDown}
                 onMouseMove={handleCanvasMouseMove}
                 onMouseUp={handleCanvasMouseUp}
+                onMouseLeave={handleAdjustmentCanvasMouseLeave}
                 style={{
                   position: "absolute",
                   top: "50%",
@@ -1550,7 +2006,12 @@ function AICameraSetup() {
                   transform: "translate(-50%, -50%)",
                   maxWidth: "100%",
                   maxHeight: "100%",
-                  cursor: isDrawingMode || aoiMode ? "crosshair" : "default",
+                  cursor:
+                    isAdjustingGrids && isFrozen
+                      ? "grab"
+                      : isDrawingMode || aoiMode
+                        ? "crosshair"
+                        : "default",
                   pointerEvents: isFrozen ? "auto" : "none",
                 }}
               />
@@ -1564,6 +2025,13 @@ function AICameraSetup() {
               >
                 {isFrozen ? "▶️ Unfreeze" : "⏸ Freeze"}
               </button>
+            )}
+
+            {/* Action Status - only show when not actively drawing */}
+            {isFrozen && !isDrawingMode && !aoiMode && (
+              <div style={styles.floatingActionButton}>
+                {aoiRect ? "✏️ Draw Slot" : "🎯 Draw Area of Interest"}
+              </div>
             )}
 
             {/* No Camera Message */}
