@@ -15,7 +15,13 @@ const MIN_FRAME_INTERVAL = 1000 / TARGET_FPS; // Minimum ms between processed fr
 /**
  * Start camera worker for a parking spot
  */
-function startCameraWorker({ spotId, cameraUrl, pythonServer, io }) {
+function startCameraWorker({
+  spotId,
+  cameraUrl,
+  pythonServer,
+  io,
+  onStateChange,
+}) {
   if (cameraWorkers.has(spotId)) {
     console.log(`⚠️ Camera worker already running for spot ${spotId}`);
     return;
@@ -117,12 +123,26 @@ function startCameraWorker({ spotId, cameraUrl, pythonServer, io }) {
         });
       }
 
-      // If state changed, broadcast that too
+      // If state changed, broadcast that too and invoke optional DB callback
       if (response.data.state_change) {
+        const change = response.data.state_change;
+
         io.to(`spot_${spotId}`).emit("state_change", {
           spot_id: spotId,
-          change: response.data.state_change,
+          change: change,
         });
+
+        // If the caller provided a handler, call it (allow async handlers)
+        if (typeof onStateChange === "function") {
+          try {
+            await onStateChange(spotId, change);
+          } catch (cbErr) {
+            console.error(
+              `❌ onStateChange handler error [spot ${spotId}]:`,
+              cbErr?.message || cbErr,
+            );
+          }
+        }
       }
 
       // Calculate FPS (based on processed frames)

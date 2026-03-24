@@ -36,6 +36,8 @@ function UserReservations() {
   const [activeTab, setActiveTab] = useState("upcoming");
 
   const token = localStorage.getItem("token");
+  const getBookingStatus = (reservation) =>
+    reservation?.actual_status || reservation?.status;
 
   // Check URL parameters for highlighted booking
   // Highlight booking and optionally switch to history tab if needed
@@ -51,8 +53,9 @@ function UserReservations() {
         (r) => String(r.booking_id) === String(bookingId),
       );
       if (found) {
+        const status = getBookingStatus(found);
         // If it's not in upcoming, switch to history
-        if (found.status !== "active" && found.status !== "scheduled") {
+        if (status !== "active" && status !== "scheduled") {
           setActiveTab("history");
         }
       } else {
@@ -137,12 +140,14 @@ function UserReservations() {
 
   // Calculate tab counts
   const counts = useMemo(() => {
-    const activeOrScheduled = reservations.filter(
-      (r) => r.status === "active" || r.status === "scheduled",
-    );
-    const history = reservations.filter(
-      (r) => r.status !== "active" && r.status !== "scheduled",
-    );
+    const activeOrScheduled = reservations.filter((r) => {
+      const status = getBookingStatus(r);
+      return status === "active" || status === "scheduled";
+    });
+    const history = reservations.filter((r) => {
+      const status = getBookingStatus(r);
+      return status !== "active" && status !== "scheduled";
+    });
     return { upcoming: activeOrScheduled.length, history: history.length };
   }, [reservations]);
 
@@ -454,12 +459,14 @@ function UserReservations() {
   };
 
   // Partition reservations by tab
-  const upcomingReservations = reservations.filter(
-    (r) => r.status === "active" || r.status === "scheduled",
-  );
-  const historyReservations = reservations.filter(
-    (r) => r.status !== "active" && r.status !== "scheduled",
-  );
+  const upcomingReservations = reservations.filter((r) => {
+    const status = getBookingStatus(r);
+    return status === "active" || status === "scheduled";
+  });
+  const historyReservations = reservations.filter((r) => {
+    const status = getBookingStatus(r);
+    return status !== "active" && status !== "scheduled";
+  });
 
   const getProgressAndCountdown = (r) => {
     const actualStatus = r.actual_status || r.status;
@@ -468,18 +475,6 @@ function UserReservations() {
     const startAt = parseDate(r.start_at || r.reserved_at);
     const durationMs = (parseInt(r.duration_minutes || 0, 10) || 0) * 60 * 1000;
     const nowDate = new Date(now);
-
-    // DEBUG - Now actualStatus is defined
-    console.log("Booking #" + r.booking_id + " Debug:", {
-      actualStatus,
-      reserved_at_raw: r.reserved_at,
-      start_at_raw: r.start_at,
-      reservedAt: reservedAt,
-      startAt: startAt,
-      nowDate: nowDate,
-      duration_minutes: r.duration_minutes,
-      time_until_start_hours: (startAt - nowDate) / (1000 * 60 * 60),
-    });
 
     let remainingMs = null;
     let percent = 0;
@@ -1250,8 +1245,8 @@ function UserReservations() {
                               alignItems: "flex-end",
                             }}
                           >
-                            {(r.status === "active" ||
-                              r.status === "scheduled") &&
+                            {(actualStatus === "active" ||
+                              actualStatus === "scheduled") &&
                               (canCancelBooking(r) ? (
                                 <div>
                                   <button
@@ -1261,11 +1256,11 @@ function UserReservations() {
                                       alignItems: "center",
                                       gap: "8px",
                                       backgroundColor:
-                                        r.status === "active"
+                                        actualStatus === "active"
                                           ? "#fef2f2"
                                           : "#fff",
                                       color:
-                                        r.status === "active"
+                                        actualStatus === "active"
                                           ? "#dc2626"
                                           : "#111827",
                                       padding: "8px 16px",
@@ -1273,7 +1268,7 @@ function UserReservations() {
                                       fontWeight: "600",
                                       fontSize: "13px",
                                       border:
-                                        r.status === "active"
+                                        actualStatus === "active"
                                           ? "1px solid #fecaca"
                                           : "1px solid #e5e7eb",
                                       cursor: "pointer",
@@ -1293,7 +1288,7 @@ function UserReservations() {
                                         textAlign: "right",
                                       }}
                                     >
-                                      {r.status === "active"
+                                      {actualStatus === "active"
                                         ? `Cancel within: ${remainingCancelTime}`
                                         : `Can cancel for: ${remainingCancelTime}`}
                                     </div>
@@ -1318,7 +1313,7 @@ function UserReservations() {
                                     style={{ width: "14px", height: "14px" }}
                                   />
                                   <span>
-                                    {r.status === "scheduled"
+                                    {actualStatus === "scheduled"
                                       ? "Cancel window passed"
                                       : "Cannot cancel"}
                                   </span>
@@ -1538,7 +1533,7 @@ function UserReservations() {
                             flexWrap: "wrap",
                           }}
                         >
-                          {r.status === "expired" &&
+                          {actualStatus === "expired" &&
                             parkingId &&
                             (!eligibility ? (
                               <div

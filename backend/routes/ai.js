@@ -352,6 +352,92 @@ router.post("/start-detection", auth(["owner"]), async (req, res) => {
             cameraUrl: grid_config.camera_url,
             pythonServer: PYTHON_AI_SERVER,
             io: io,
+            onStateChange: async (spotId, change) => {
+              try {
+                // session may be stored with numeric or string key
+                const session =
+                  activeSessions.get(spotId) ||
+                  activeSessions.get(parseInt(spotId));
+                const slotMapping = session?.slot_mapping || {};
+
+                const slotNumber =
+                  change?.slot_number ?? change?.slot ?? change?.index;
+                const slotId = slotMapping[String(slotNumber)];
+                if (!slotId) {
+                  console.warn(
+                    `⚠️ onStateChange: slot mapping not found for spot ${spotId}, slot ${slotNumber}`,
+                  );
+                  return;
+                }
+
+                // Determine new status and confidence from change payload
+                const newStatus =
+                  change?.new ||
+                  change?.new_status ||
+                  change?.new_state ||
+                  change?.to ||
+                  change?.status;
+                const confidence = change?.confidence || change?.conf || null;
+                const isAvailable = newStatus === "vacant" ? 1 : 0;
+
+                // Update the specific parking slot
+                db.query(
+                  "UPDATE parking_slots SET is_available = ? WHERE id = ?",
+                  [isAvailable, slotId],
+                  (err) => {
+                    if (err) {
+                      console.error("❌ DB update error (onStateChange):", err);
+                      return;
+                    }
+
+                    // Update aggregates for the spot
+                    db.query(
+                      `UPDATE parking_spots 
+                       SET available_slots = (SELECT COUNT(*) FROM parking_slots WHERE parking_spot_id = ? AND is_active = 1 AND is_available = 1),
+                           occupied_slots  = (SELECT COUNT(*) FROM parking_slots WHERE parking_spot_id = ? AND is_active = 1 AND is_available = 0)
+                       WHERE id = ?`,
+                      [spotId, spotId, spotId],
+                      (err2) => {
+                        if (err2)
+                          console.error(
+                            "⚠️ Stats update error (onStateChange):",
+                            err2,
+                          );
+                      },
+                    );
+
+                    // Insert detection log
+                    db.query(
+                      `INSERT INTO ai_detection_logs (parking_spot_id, slot_id, detection_type, confidence, created_at) VALUES (?, ?, ?, ?, NOW())`,
+                      [spotId, slotId, newStatus, confidence],
+                      (err3) => {
+                        if (err3)
+                          console.warn("⚠️ Log error (onStateChange):", err3);
+                      },
+                    );
+
+                    // Update in-memory session last_states if present
+                    try {
+                      if (session) {
+                        session.last_states = session.last_states || {};
+                        session.last_states[String(slotId)] = newStatus;
+                        const key = isNaN(Number(spotId))
+                          ? spotId
+                          : Number(spotId);
+                        activeSessions.set(key, session);
+                      }
+                    } catch (e) {
+                      // non-fatal
+                    }
+                  },
+                );
+              } catch (e) {
+                console.error(
+                  `❌ onStateChange handler failed for spot ${spotId}:`,
+                  e?.message || e,
+                );
+              }
+            },
           });
 
           console.log(

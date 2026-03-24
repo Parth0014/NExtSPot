@@ -29,18 +29,22 @@ const BookingSchedule = ({ parkingSpotId, onClose }) => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [parkingSpotId, daysToShow]);
 
-  const groupByDate = () => {
-    if (!scheduleData?.schedule) return {};
+  const toDateKey = (value) => {
+    if (!value) return "";
+    if (typeof value === "string") {
+      return value.includes("T") ? value.split("T")[0] : value;
+    }
+    const d = new Date(value);
+    if (Number.isNaN(d.getTime())) return "";
+    return d.toISOString().split("T")[0];
+  };
 
-    const grouped = {};
-    scheduleData.schedule.forEach((item) => {
-      const date = item.booking_date.split("T")[0]; // Get YYYY-MM-DD
-      if (!grouped[date]) {
-        grouped[date] = [];
-      }
-      grouped[date].push(item);
-    });
-    return grouped;
+  const toStartDateTime = (bookingDate, bookingHour) => {
+    const dateKey = toDateKey(bookingDate);
+    const hour = Number(bookingHour);
+    if (!dateKey || Number.isNaN(hour)) return null;
+    const safeHour = String(hour).padStart(2, "0");
+    return new Date(`${dateKey}T${safeHour}:00:00`);
   };
 
   const formatDate = (dateString) => {
@@ -93,8 +97,95 @@ const BookingSchedule = ({ parkingSpotId, onClose }) => {
     );
   }
 
-  const groupedSchedule = groupByDate();
   const spot = scheduleData?.spot;
+  const now = new Date();
+
+  const rows = (scheduleData?.schedule || []).map((item) => {
+    const startAt = toStartDateTime(item.booking_date, item.booking_hour);
+    const dateKey = toDateKey(item.booking_date);
+    const hour = Number(item.booking_hour) || 0;
+    const endHour = (hour + 1) % 24;
+    const availableSlots = Math.max(
+      0,
+      (spot?.active_slots || 0) - Number(item.slots_booked || 0),
+    );
+    return {
+      ...item,
+      dateKey,
+      hour,
+      endHour,
+      startAt,
+      availableSlots,
+    };
+  });
+
+  const currentRows = rows.filter((row) => {
+    if (!row.startAt) return false;
+    const endAt = new Date(row.startAt.getTime() + 60 * 60 * 1000);
+    return row.startAt <= now && now < endAt;
+  });
+
+  const futureRows = rows.filter((row) => row.startAt && row.startAt > now);
+
+  const renderTable = (tableRows) => (
+    <div className="schedule-table-wrap">
+      <table className="schedule-table">
+        <thead>
+          <tr>
+            <th>Date</th>
+            <th>Time</th>
+            <th>Booked</th>
+            <th>Available</th>
+            <th>Details</th>
+          </tr>
+        </thead>
+        <tbody>
+          {tableRows.map((row, idx) => {
+            const availabilityColor = getAvailabilityColor(
+              Number(row.slots_booked || 0),
+              spot?.active_slots || 1,
+            );
+            return (
+              <tr key={`${row.dateKey}-${row.hour}-${idx}`}>
+                <td>{formatDate(row.dateKey)}</td>
+                <td>
+                  {String(row.hour).padStart(2, "0")}:00 -{" "}
+                  {String(row.endHour).padStart(2, "0")}:00
+                </td>
+                <td>
+                  {row.slots_booked}/{spot?.active_slots || 0}
+                </td>
+                <td>
+                  <span
+                    className="availability-badge"
+                    style={{ backgroundColor: availabilityColor }}
+                  >
+                    {row.availableSlots}
+                  </span>
+                </td>
+                <td>
+                  {row.booking_details ? (
+                    <details className="booking-details-expand">
+                      <summary>View</summary>
+                      <div className="booking-details-list">
+                        {row.booking_details.split("; ").map((detail, i) => (
+                          <div key={i} className="booking-detail-item">
+                            • {detail}
+                          </div>
+                        ))}
+                      </div>
+                    </details>
+                  ) : (
+                    <span>-</span>
+                  )}
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
 
   return (
     <div className="booking-schedule-overlay" onClick={onClose}>
@@ -140,82 +231,39 @@ const BookingSchedule = ({ parkingSpotId, onClose }) => {
         </div>
 
         <div className="schedule-content">
-          {Object.keys(groupedSchedule).length === 0 ? (
+          {rows.length === 0 ? (
             <div className="no-bookings">
               <p>🎉 No bookings scheduled for the selected period!</p>
               <p>All slots are available for booking.</p>
             </div>
           ) : (
-            Object.entries(groupedSchedule).map(([date, bookings]) => (
-              <div key={date} className="date-group">
+            <>
+              <div className="table-section">
                 <div className="date-header">
-                  <h4>{formatDate(date)}</h4>
-                  <span className="date-full">{date}</span>
+                  <h4>Current Bookings</h4>
+                  <span className="date-full">Active now</span>
                 </div>
-
-                <div className="time-slots">
-                  {bookings.map((booking, idx) => {
-                    const availableSlots =
-                      spot.active_slots - booking.slots_booked;
-                    const availabilityColor = getAvailabilityColor(
-                      booking.slots_booked,
-                      spot.active_slots,
-                    );
-
-                    return (
-                      <div key={idx} className="time-slot-card">
-                        <div className="time-slot-header">
-                          <span className="time-range">
-                            {booking.booking_hour}:00 -{" "}
-                            {booking.booking_hour + 1}:00
-                          </span>
-                          <span
-                            className="availability-badge"
-                            style={{ backgroundColor: availabilityColor }}
-                          >
-                            {booking.slots_booked}/{spot.active_slots} booked
-                          </span>
-                        </div>
-
-                        <div className="slot-details">
-                          <p className="available-count">
-                            {availableSlots > 0 ? (
-                              <>
-                                ✅{" "}
-                                <strong>
-                                  {availableSlots} slots available
-                                </strong>
-                              </>
-                            ) : (
-                              <>
-                                ❌ <strong>Fully booked</strong>
-                              </>
-                            )}
-                          </p>
-                          {booking.booking_details && (
-                            <details className="booking-details-expand">
-                              <summary>View booking details</summary>
-                              <div className="booking-details-list">
-                                {booking.booking_details
-                                  .split("; ")
-                                  .map((detail, i) => (
-                                    <div
-                                      key={i}
-                                      className="booking-detail-item"
-                                    >
-                                      • {detail}
-                                    </div>
-                                  ))}
-                              </div>
-                            </details>
-                          )}
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
+                {currentRows.length > 0 ? (
+                  renderTable(currentRows)
+                ) : (
+                  <p className="table-empty">No current bookings right now.</p>
+                )}
               </div>
-            ))
+
+              <div className="table-section">
+                <div className="date-header">
+                  <h4>Future Bookings</h4>
+                  <span className="date-full">Upcoming schedule</span>
+                </div>
+                {futureRows.length > 0 ? (
+                  renderTable(futureRows)
+                ) : (
+                  <p className="table-empty">
+                    No future bookings in this range.
+                  </p>
+                )}
+              </div>
+            </>
           )}
         </div>
 
@@ -409,6 +457,48 @@ const BookingSchedule = ({ parkingSpotId, onClose }) => {
         .time-slots {
           display: grid;
           gap: 12px;
+        }
+
+        .table-section {
+          margin-bottom: 22px;
+        }
+
+        .table-empty {
+          margin: 8px 0 0;
+          color: #6b7280;
+          font-size: 14px;
+        }
+
+        .schedule-table-wrap {
+          overflow-x: auto;
+          border: 1px solid #e5e7eb;
+          border-radius: 10px;
+          background: #fff;
+        }
+
+        .schedule-table {
+          width: 100%;
+          border-collapse: collapse;
+          font-size: 13px;
+        }
+
+        .schedule-table th,
+        .schedule-table td {
+          padding: 10px 12px;
+          text-align: left;
+          border-bottom: 1px solid #f1f5f9;
+          vertical-align: top;
+        }
+
+        .schedule-table thead th {
+          background: #f8fafc;
+          color: #334155;
+          font-weight: 700;
+          white-space: nowrap;
+        }
+
+        .schedule-table tbody tr:last-child td {
+          border-bottom: none;
         }
 
         .time-slot-card {
